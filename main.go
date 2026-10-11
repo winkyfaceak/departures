@@ -68,10 +68,13 @@ func dots(text string) []string {
 	return rows
 }
 
-var suffix = regexp.MustCompile(`( (Underground|DLR|Rail|Tram))? (Station|Stop)$`)
+var suffix = regexp.MustCompile(`( (Underground|DLR|Rail|Tram))? (Station|Stop)$|-Underground$| \((Central|Bakerloo|Circle|District|H&C|Dist&Picc)( Line)?\)`)
 
-// short turns "Brixton Underground Station" into "Brixton".
-func short(name string) string { return suffix.ReplaceAllString(name, "") }
+// short turns "Brixton Underground Station" into "Brixton", and
+// "Paddington (H&C Line)-Underground" into "Paddington".
+func short(name string) string {
+	return strings.Join(strings.Fields(suffix.ReplaceAllString(name, "")), " ")
+}
 
 type line struct{ ID, Name string }
 
@@ -197,7 +200,10 @@ type model struct {
 	services  []railService // National Rail board and map
 	route     routeSeq      // TfL map
 	routeLine string        // line route belongs to
-	traffic   []arrival     // TfL map: every prediction on the line
+	schema    schematic     // route drawn for this stop
+	panX      int
+	panY      int
+	traffic   []arrival // TfL map: every prediction on the line
 	trafficAt time.Time
 	status    []lineStatus // TfL line status: this line on the board, all lines on disruptions
 	notes     []string     // National Rail station messages
@@ -285,8 +291,11 @@ func (m model) live() tea.Cmd {
 
 // show switches to the board or map and starts its fetches.
 func (m model) show(s screen) (tea.Model, tea.Cmd) {
-	m.screen, m.err, m.scroll = s, nil, 0
+	m.screen, m.err, m.scroll, m.panX, m.panY = s, nil, 0, 0, 0
 	m.gen++
+	if s == mapScreen && m.routeLine == m.line.ID && m.schema.here != m.stop.NaptanID {
+		m.schema = buildSchematic(m.route, m.stop.NaptanID, m.mode == "bus")
+	}
 	if m.mode == nationalRail && railKey == "" {
 		m.err = errNoKey
 		return m, nil
@@ -329,6 +338,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case routeSeq:
 			if msg.err == nil {
 				m.route, m.routeLine = v, m.line.ID
+				m.schema = buildSchematic(v, m.stop.NaptanID, m.mode == "bus")
 			}
 		case tflBoard:
 			if msg.err == nil {
@@ -368,7 +378,18 @@ func (m model) key(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		case "m", "b", "esc":
 			return m.show(board)
+		case "left":
+			m.panX -= m.w / 4
+		case "right":
+			m.panX += m.w / 4
+		case "up":
+			m.panY -= m.h / 4
+		case "down":
+			m.panY += m.h / 4
 		}
+		// Forget panning past the edge so the way back is immediate.
+		ox, oy := m.mapOrigin()
+		m.panX, m.panY = ox-(m.schema.at[m.schema.here].x-m.w/2), oy-(m.schema.at[m.schema.here].y-max(1, m.h-2)/2)
 		return m, nil
 	}
 	if m.screen == disruptions {
@@ -479,6 +500,9 @@ func (m model) View() tea.View {
 	v := tea.NewView(s)
 	v.AltScreen = true
 	v.BackgroundColor = color.Black
+	if m.screen == mapScreen && m.mode != nationalRail {
+		v.BackgroundColor = color.White // the tube map is on paper
+	}
 	v.WindowTitle = "Departures"
 	return v
 }

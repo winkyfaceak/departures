@@ -125,3 +125,44 @@ func TestDisruptions(t *testing.T) {
 		t.Errorf("delay reason ticker = %q", r.ticker)
 	}
 }
+
+func TestSchematic(t *testing.T) {
+	// A, B, C run west to east; D branches north from B.
+	var r routeSeq
+	if err := json.Unmarshal([]byte(`{
+		"stopPointSequences":[{"stopPoint":[
+			{"id":"A","name":"Alpha Underground Station","lat":51.50,"lon":-0.20,"lines":[{"id":"x"},{"id":"y"}]},
+			{"id":"B","name":"Bravo Underground Station","lat":51.50,"lon":-0.15},
+			{"id":"C","name":"Charlie Underground Station","lat":51.50,"lon":-0.10},
+			{"id":"D","name":"Delta Underground Station","lat":51.56,"lon":-0.15}]}],
+		"orderedLineRoutes":[{"naptanIds":["A","B","C"]},{"naptanIds":["D","B","A"]}]}`), &r); err != nil {
+		t.Fatal(err)
+	}
+	s := buildSchematic(r, "B", false)
+	text := ""
+	for y := range s.h {
+		for x := range s.w {
+			text += string(s.cells[y*s.w+x].r)
+		}
+		text += "\n"
+	}
+	for _, name := range []string{"Alpha", "Bravo", "Charlie", "Delta", "◉", "○"} {
+		if !strings.Contains(text, name) {
+			t.Errorf("schematic missing %q:\n%s", name, text)
+		}
+	}
+	p := s.paths[[2]string{"A", "B"}]
+	if len(p) < 2 || p[0] != s.at["A"] || p[len(p)-1] != s.at["B"] || s.paths[[2]string{"B", "A"}][0] != s.at["B"] {
+		t.Errorf("A→B path %v doesn't join A %v to B %v", p, s.at["A"], s.at["B"])
+	}
+
+	// A train due at B in 60s, then C 120s later: halfway from A to B, heading east.
+	m := model{route: r, schema: s, trafficAt: time.Now(), traffic: []arrival{
+		{VehicleID: "1", NaptanID: "B", DestinationNaptanID: "C", TimeToStation: 60},
+		{VehicleID: "1", NaptanID: "C", DestinationNaptanID: "C", TimeToStation: 180},
+	}}
+	trains := m.trains()
+	if len(trains) != 1 || trains[p[len(p)/2]] != '▶' {
+		t.Errorf("want ▶ at %v, got %v", p[len(p)/2], trains)
+	}
+}

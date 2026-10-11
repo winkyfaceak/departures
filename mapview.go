@@ -1,17 +1,16 @@
 package main
 
 import (
-	"fmt"
 	"math"
 	"strings"
-	"time"
 )
 
 type routeSeq struct {
 	StopPointSequences []struct {
 		StopPoint []struct {
-			ID       string
+			ID, Name string
 			Lat, Lon float64
+			Lines    []struct{ ID string }
 		}
 	}
 	OrderedLineRoutes []struct{ NaptanIDs []string }
@@ -39,48 +38,6 @@ func prevStop(r routeSeq, next, dest string) string {
 		}
 	}
 	return ""
-}
-
-// tflMap returns the line's routes and where each vehicle is now.
-func (m model) tflMap() (routes [][]pt, vehicles []pt) {
-	at := map[string]pt{}
-	for _, seq := range m.route.StopPointSequences {
-		for _, s := range seq.StopPoint {
-			at[s.ID] = pt{s.Lat, s.Lon}
-		}
-	}
-	for _, r := range m.route.OrderedLineRoutes {
-		var line []pt
-		for _, id := range r.NaptanIDs {
-			if p, ok := at[id]; ok {
-				line = append(line, p)
-			}
-		}
-		routes = append(routes, line)
-	}
-
-	// A vehicle's soonest prediction is the stop it's heading for.
-	next := map[string]arrival{}
-	for _, a := range m.traffic {
-		if b, ok := next[a.VehicleID]; !ok || a.TimeToStation < b.TimeToStation {
-			next[a.VehicleID] = a
-		}
-	}
-	age := time.Since(m.trafficAt).Seconds()
-	for _, a := range next {
-		to, ok := at[a.NaptanID]
-		if !ok {
-			continue
-		}
-		from, ok := at[prevStop(m.route, a.NaptanID, a.DestinationNaptanID)]
-		if !ok {
-			from = to
-		}
-		// ponytail: assumes ~2 min between stops; use timetabled run times if it looks jumpy
-		f := math.Max(0, math.Min(1, (a.TimeToStation-age)/120))
-		vehicles = append(vehicles, pt{to.lat + (from.lat-to.lat)*f, to.lon + (from.lon-to.lon)*f})
-	}
-	return routes, vehicles
 }
 
 // railMap returns each departure's route through this station and where
@@ -112,22 +69,18 @@ func (m model) railMap() (routes [][]pt, trains []pt) {
 	return routes, trains
 }
 
+// mapView is the schematic line map for TfL, or departures' routes for National Rail.
 func (m model) mapView() string {
-	iw, ih := m.w-4, m.h-3
-	var routes [][]pt
-	var vehicles []pt
-	title := short(m.stop.CommonName) + " · next departures"
-	if m.mode == nationalRail {
-		routes, vehicles = m.railMap()
-	} else {
-		routes, vehicles = m.tflMap()
-		title = fmt.Sprintf("%s · %d vehicles", m.line.Name, len(vehicles))
+	if m.mode != nationalRail {
+		return m.schematicView()
 	}
-	out := []string{fit(title, iw), ""}
+	iw, ih := m.w-4, m.h-3
+	routes, vehicles := m.railMap()
+	out := []string{fit(short(m.stop.CommonName)+" · next departures", iw), ""}
 	switch {
 	case m.err == errNoKey:
 		out = append(out, errNoKey.Error())
-	case len(routes) == 0 && (m.loading || m.mode != nationalRail && m.routeLine != m.line.ID):
+	case len(routes) == 0 && m.loading:
 		out = append(out, "Loading…")
 	case len(routes) == 0 && m.err != nil:
 		out = append(out, "Failed: "+m.err.Error())

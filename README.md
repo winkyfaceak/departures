@@ -32,7 +32,7 @@ Run `departures`, then pick a mode (tube, Elizabeth line, Overground, DLR, tram,
 
 On the board: `p` cycles platforms, `m` opens the map, `b` goes back, `q` quits. Arrivals refresh every 30 seconds. If your line or bus route has delays or closures, the board warns you under the title and scrolls the reason; on National Rail it scrolls station messages and why a train is delayed or cancelled.
 
-The map draws the line in braille dots with every train or bus on it (●) and your stop (◆). For National Rail it draws the routes of the next departures through the station, with each train at the last stop it reported. `m` goes back to the board.
+The map (`m`) draws your line like the tube map: in its own colour on white, straight runs and 45° bends, every stop ticked and named, interchanges circled, your station highlighted. Every train or bus is an arrow on the track showing which way it's heading, placed between its last and next stop from its live predictions and moving as the countdown runs. Arrow keys pan; `m` goes back to the board. For National Rail it draws the routes of the next departures through the station in braille dots, with each train at the last stop it reported.
 
 ### National Rail key
 
