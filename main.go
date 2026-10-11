@@ -23,9 +23,10 @@ const (
 	api          = "https://api.tfl.gov.uk"
 	refresh      = 30 * time.Second // keyless TfL allows 50 requests/min
 	nationalRail = "national-rail"
+	disrupted    = "disruptions"
 )
 
-var modes = []string{"tube", "elizabeth-line", "overground", "dlr", "tram", "bus", nationalRail}
+var modes = []string{disrupted, "tube", "elizabeth-line", "overground", "dlr", "tram", "bus", nationalRail}
 
 var (
 	amber  = lipgloss.Color("#FFB000")
@@ -271,12 +272,12 @@ func platforms(rows []row) []string {
 // live fetches whatever the current board, map or disruptions screen shows.
 func (m model) live() tea.Cmd {
 	switch {
+	case m.screen == disruptions:
+		return fetchStatus(m.gen)
 	case m.mode == nationalRail:
 		return fetchRail(m.gen, m.stop.NaptanID)
 	case m.screen == mapScreen:
 		return fetch[[]arrival](m.gen, api+"/Line/"+m.line.ID+"/Arrivals")
-	case m.screen == disruptions:
-		return fetchStatus(m.gen, m.mode, m.line.ID)
 	default:
 		return fetchBoard(m.gen, m.line.ID, m.stop.NaptanID)
 	}
@@ -361,12 +362,22 @@ func (m model) key(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	if k == "ctrl+c" {
 		return m, tea.Quit
 	}
-	if m.screen == mapScreen || m.screen == disruptions {
+	if m.screen == mapScreen {
 		switch k {
 		case "q":
 			return m, tea.Quit
-		case "m", "d", "b", "esc":
+		case "m", "b", "esc":
 			return m.show(board)
+		}
+		return m, nil
+	}
+	if m.screen == disruptions {
+		switch k {
+		case "q":
+			return m, tea.Quit
+		case "b", "esc":
+			m.screen, m.err = pickMode, nil
+			m.gen++
 		case "up":
 			m.scroll = max(0, m.scroll-1)
 		case "down":
@@ -386,8 +397,6 @@ func (m model) key(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.platform++
 		case "m":
 			return m.show(mapScreen)
-		case "d":
-			return m.show(disruptions)
 		}
 		return m, nil
 	}
@@ -429,6 +438,9 @@ func (m model) key(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		switch m.screen {
 		case pickMode:
 			m.mode = modes[i]
+			if m.mode == disrupted {
+				return m.show(disruptions)
+			}
 			if m.mode == nationalRail {
 				m.line = line{nationalRail, "National Rail"}
 				m.stops, m.screen, m.query, m.sel = railStations, pickStop, "", 0
@@ -440,7 +452,7 @@ func (m model) key(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.line, m.loading = m.lines[i], true
 			return m, fetch[[]stop](m.gen, api+"/Line/"+m.line.ID+"/StopPoints")
 		case pickStop:
-			m.stop, m.arrivals, m.services, m.platform = m.stops[i], nil, nil, 0
+			m.stop, m.arrivals, m.services, m.notes, m.platform = m.stops[i], nil, nil, nil, 0
 			return m.show(board)
 		}
 	default:
@@ -582,7 +594,7 @@ func (m model) boardView() string {
 	} else {
 		out = append(out, lipgloss.PlaceHorizontal(iw, lipgloss.Center, time.Now().Format("15:04:05")))
 	}
-	return m.frame(out, " p platform · m map · d disruptions · b back · q quit")
+	return m.frame(out, " p platform · m map · b back · q quit")
 }
 
 // fit truncates s to n runes.

@@ -104,17 +104,21 @@ func TestDisruptions(t *testing.T) {
 	if m.notice() != "" {
 		t.Errorf("good service shouldn't warn: %q", m.notice())
 	}
-	_, body := m.disruptionLines(56)
-	if !strings.HasPrefix(body[0], "Central") || !strings.HasPrefix(body[1], "Piccadilly") {
-		t.Errorf("want your line, then problems first: %q", body[:2])
+	body := m.disruptionLines(56)
+	if !strings.HasPrefix(body[0], "Piccadilly") || !strings.HasPrefix(body[3], "Victoria") {
+		t.Errorf("want problems (with reasons) first, then good service: %q", body)
 	}
 	m.line.ID = "piccadilly"
-	if m.notice() != "▲ Severe Delays · Part Closure · d for details" || m.troubleReason() != "Signal failure.   Engineering works." {
+	if m.notice() != "▲ Severe Delays · Part Closure" || m.troubleReason() != "Signal failure.   Engineering works." {
 		t.Errorf("notice %q reason %q", m.notice(), m.troubleReason())
 	}
 
 	if got := plain(`<p>Disruption at <a href="x">Reading</a> &amp; Slough.</p>`); got != "Disruption at Reading & Slough." {
 		t.Errorf("plain = %q", got)
+	}
+	m = model{mode: nationalRail, notes: []string{"Lifts out of order."}}
+	if m.notice() != "▲ Station messages (1)" || m.troubleReason() != "Lifts out of order." {
+		t.Errorf("station messages: notice %q ticker %q", m.notice(), m.troubleReason())
 	}
 	s := railService{Std: "09:00", Etd: "Delayed", DelayReason: "This train has been delayed by a signalling fault"}
 	if r := s.row(); r.ticker != "This train has been delayed by a signalling fault.  " {

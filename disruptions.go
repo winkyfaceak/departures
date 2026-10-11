@@ -1,7 +1,6 @@
 package main
 
 import (
-	"cmp"
 	"fmt"
 	"slices"
 	"sort"
@@ -11,8 +10,7 @@ import (
 	"charm.land/lipgloss/v2"
 )
 
-// railModes are the TfL modes the disruptions screen always covers; a bus
-// route is added when that's what you're looking at.
+// railModes are the TfL modes the disruptions screen covers.
 const railModes = "tube,elizabeth-line,overground,dlr,tram"
 
 type lineStatus struct {
@@ -61,16 +59,8 @@ func fetchBoard(gen int, line, stop string) tea.Cmd {
 	}
 }
 
-func fetchStatus(gen int, mode, line string) tea.Cmd {
-	return func() tea.Msg {
-		all, err := get[[]lineStatus](api + "/Line/Mode/" + railModes + "/Status")
-		if err == nil && !slices.Contains(strings.Split(railModes, ","), mode) {
-			var own []lineStatus
-			own, err = get[[]lineStatus](api + "/Line/" + line + "/Status")
-			all = append(own, all...)
-		}
-		return loaded{gen, all, err}
-	}
+func fetchStatus(gen int) tea.Cmd {
+	return fetch[[]lineStatus](gen, api+"/Line/Mode/"+railModes+"/Status")
 }
 
 // trouble is this line's status when it isn't good service.
@@ -86,105 +76,68 @@ func (m model) trouble() (lineStatus, bool) {
 // notice is the board's warning line: this line's status or station messages.
 func (m model) notice() string {
 	if l, ok := m.trouble(); ok {
-		return "▲ " + l.summary() + " · d for details"
+		return "▲ " + l.summary()
 	}
 	if n := len(m.notes); n > 0 {
-		return fmt.Sprintf("▲ Station messages (%d) · d to read", n)
+		return fmt.Sprintf("▲ Station messages (%d)", n)
 	}
 	return ""
 }
 
-// troubleReason is the text the board scrolls when the line has problems.
+// troubleReason is the text the board scrolls for line problems or station messages.
 func (m model) troubleReason() string {
+	r := slices.Clone(m.notes)
 	l, _ := m.trouble()
-	var r []string
 	for _, s := range l.LineStatuses {
-		if s.Reason != "" && !slices.Contains(r, s.Reason) {
+		if s.Reason != "" && !slices.Contains(r, strings.TrimSpace(s.Reason)) {
 			r = append(r, strings.TrimSpace(s.Reason))
 		}
 	}
 	return strings.Join(r, "   ")
 }
 
-// disruptionLines is the disruptions screen's title and scrollable body.
-func (m model) disruptionLines(iw int) (string, []string) {
+// disruptionLines is the disruptions screen's scrollable body: problems
+// first with their reasons, then good service.
+func (m model) disruptionLines(iw int) []string {
 	wrap := lipgloss.NewStyle().Width(iw - 2)
-	para := func(out []string, text string) []string {
-		for _, l := range strings.Split(wrap.Render(text), "\n") {
-			out = append(out, dim.Render("  "+l))
-		}
-		return out
-	}
-	both := func(left, right string) string {
-		left = fit(left, iw-lipgloss.Width(right)-1)
-		return left + strings.Repeat(" ", max(1, iw-lipgloss.Width(left)-lipgloss.Width(right))) + right
-	}
-
-	var title string
+	lines := slices.Clone(m.status)
+	sort.SliceStable(lines, func(i, j int) bool { return !lines[i].fine() && lines[j].fine() })
 	var body []string
-	if m.mode == nationalRail {
-		title = short(m.stop.CommonName) + " · disruptions"
-		for _, n := range m.notes {
-			body = append(para(body, n), "")
-		}
-		for _, s := range m.services {
-			if reason := cmp.Or(s.CancelReason, s.DelayReason); reason != "" {
-				r := s.row()
-				body = append(para(append(body, both(r.left, s.Etd)), reason), "")
-			}
-		}
-	} else {
-		title = "Service status"
-		// Your line first, then problems, then good service.
-		lines := slices.Clone(m.status)
-		rank := func(l lineStatus) int {
-			switch {
-			case l.ID == m.line.ID:
-				return 0
-			case !l.fine():
-				return 1
-			}
-			return 2
-		}
-		sort.SliceStable(lines, func(i, j int) bool { return rank(lines[i]) < rank(lines[j]) })
-		for _, l := range lines {
-			body = append(body, both(l.Name, l.summary()))
-			var seen []string
-			for _, s := range l.LineStatuses {
-				if s.Reason != "" && !slices.Contains(seen, s.Reason) {
-					seen = append(seen, s.Reason)
-					body = para(body, s.Reason)
+	for _, l := range lines {
+		right := l.summary()
+		left := fit(l.Name, iw-lipgloss.Width(right)-1)
+		body = append(body, left+strings.Repeat(" ", max(1, iw-lipgloss.Width(left)-lipgloss.Width(right)))+right)
+		var seen []string
+		for _, s := range l.LineStatuses {
+			if s.Reason != "" && !slices.Contains(seen, s.Reason) {
+				seen = append(seen, s.Reason)
+				for _, w := range strings.Split(wrap.Render(s.Reason), "\n") {
+					body = append(body, dim.Render("  "+w))
 				}
 			}
 		}
 	}
 	switch {
-	case len(body) == 0 && m.err == errNoKey:
-		body = []string{errNoKey.Error()}
 	case len(body) == 0 && m.loading:
 		body = []string{"Loading…"}
 	case len(body) == 0 && m.err != nil:
 		body = []string{"Failed: " + m.err.Error()}
-	case len(body) == 0:
-		body = []string{"No disruption reported."}
 	}
-	return title, body
+	return body
 }
 
 // disruptionsTop clamps the scroll position to the body.
 func (m model) disruptionsTop() int {
-	_, body := m.disruptionLines(m.w - 4)
-	return min(m.scroll, max(0, len(body)-max(1, m.h-5)))
+	return min(m.scroll, max(0, len(m.disruptionLines(m.w-4))-max(1, m.h-5)))
 }
 
 func (m model) disruptionsView() string {
 	iw, ih := m.w-4, m.h-3
-	title, body := m.disruptionLines(iw)
-	visible := max(1, ih-2)
-	top := m.disruptionsTop()
-	out := append([]string{fit(title, iw), ""}, body[top:min(len(body), top+visible)]...)
+	body, top := m.disruptionLines(iw), m.disruptionsTop()
+	out := append([]string{"Service status · tube, Elizabeth line, Overground, DLR, tram", ""}, body[top:min(len(body), top+ih-2)]...)
+	out[0] = fit(out[0], iw)
 	for len(out) < ih {
 		out = append(out, "")
 	}
-	return m.frame(out, " ↑↓ scroll · d board · q quit")
+	return m.frame(out, " ↑↓ scroll · esc back · q quit")
 }
