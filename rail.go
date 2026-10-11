@@ -8,8 +8,10 @@ import (
 	"html"
 	"os"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
 )
@@ -73,6 +75,46 @@ type railService struct {
 }
 
 type callingPoint struct{ LocationName, Crs, At string }
+
+// timedDeparture is a train from TfL's ArrivalDepartures, which covers
+// Thameslink without a National Rail key.
+type timedDeparture struct {
+	PlatformName, DestinationName, DepartureStatus, Cause string
+	ScheduledTimeOfDeparture, EstimatedTimeOfDeparture    time.Time
+}
+
+func (d timedDeparture) when() time.Time {
+	return cmp.Or(d.EstimatedTimeOfDeparture, d.ScheduledTimeOfDeparture)
+}
+
+func (d timedDeparture) row() row {
+	right := "On time"
+	switch {
+	case d.DepartureStatus == "Cancelled":
+		right = "Cancelled"
+	case d.EstimatedTimeOfDeparture.IsZero():
+		right = "Delayed"
+	case d.EstimatedTimeOfDeparture.Sub(d.ScheduledTimeOfDeparture) >= time.Minute:
+		right = "Exp " + d.EstimatedTimeOfDeparture.Local().Format("15:04")
+	}
+	if p := strings.TrimPrefix(d.PlatformName, "Platform "); p != "" {
+		right = "Plat " + p + "  " + right
+	}
+	return row{d.ScheduledTimeOfDeparture.Local().Format("15:04") + "  " + short(d.DestinationName), right, d.PlatformName, d.Cause}
+}
+
+// timedRows lists departures soonest first, dropping those gone over a minute.
+func timedRows(ds []timedDeparture, now time.Time) []row {
+	ds = slices.Clone(ds)
+	slices.SortFunc(ds, func(a, b timedDeparture) int { return a.when().Compare(b.when()) })
+	var rows []row
+	for _, d := range ds {
+		if d.when().After(now.Add(-time.Minute)) {
+			rows = append(rows, d.row())
+		}
+	}
+	return rows
+}
 
 func fetchRail(gen int, crs string) tea.Cmd {
 	return fetch[railBoard](gen, railAPI+crs+"?numRows=10")

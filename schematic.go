@@ -480,6 +480,9 @@ func (m model) schematicView() string {
 	vw, vh := m.w, max(1, m.h-2)
 
 	title := fmt.Sprintf(" %s · %d moving ", m.line.Name, len(trains))
+	if m.mode == thameslink { // TfL has Thameslink departures, not train positions
+		title = " Thameslink "
+	}
 	bar := lipgloss.NewStyle().Foreground(contrast(hex)).Background(colour).Bold(true).Width(vw)
 	footer := " ←↑↓→ pan · m board · q quit"
 	if m.err != nil {

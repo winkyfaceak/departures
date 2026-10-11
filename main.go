@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -23,10 +24,11 @@ const (
 	api          = "https://api.tfl.gov.uk"
 	refresh      = 30 * time.Second // keyless TfL allows 50 requests/min
 	nationalRail = "national-rail"
+	thameslink   = "thameslink"
 	disrupted    = "disruptions"
 )
 
-var modes = []string{disrupted, "tube", "elizabeth-line", "overground", "dlr", "tram", "bus", nationalRail}
+var modes = []string{disrupted, "tube", "elizabeth-line", "overground", "dlr", "tram", "bus", thameslink, nationalRail}
 
 var (
 	amber  = lipgloss.Color("#FFB000")
@@ -79,9 +81,9 @@ func short(name string) string {
 type line struct{ ID, Name string }
 
 type stop struct {
-	NaptanID, CommonName, Indicator string
-	Lat, Lon                        float64
-	AdditionalProperties            []struct{ Key, Value string }
+	NaptanID, CommonName, Indicator, StopType string
+	Lat, Lon                                  float64
+	AdditionalProperties                      []struct{ Key, Value string }
 }
 
 func (s stop) label() string {
@@ -197,10 +199,11 @@ type model struct {
 	platform  int
 	arrivals  []arrival // TfL board
 	fetchedAt time.Time
-	services  []railService // National Rail board and map
-	route     routeSeq      // TfL map
-	routeLine string        // line route belongs to
-	schema    schematic     // route drawn for this stop
+	services  []railService    // National Rail board and map
+	timed     []timedDeparture // Thameslink board
+	route     routeSeq         // TfL map
+	routeLine string           // line route belongs to
+	schema    schematic        // route drawn for this stop
 	panX      int
 	panY      int
 	traffic   []arrival // TfL map: every prediction on the line
@@ -246,6 +249,9 @@ func (m model) shown() []int {
 
 func (m model) rows() []row {
 	var rows []row
+	if m.mode == thameslink {
+		return timedRows(m.timed, time.Now())
+	}
 	if m.mode == nationalRail {
 		for _, s := range m.services {
 			rows = append(rows, s.row())
@@ -332,6 +338,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case []stop:
 			if msg.err == nil {
+				// Bus "stop pairs" group both sides of a road and never have arrivals.
+				v = slices.DeleteFunc(v, func(s stop) bool { return s.StopType == "NaptanOnstreetBusCoachStopPair" })
 				sort.Slice(v, func(i, j int) bool { return v[i].label() < v[j].label() })
 				m.stops, m.screen, m.query, m.sel = v, pickStop, "", 0
 			}
@@ -342,7 +350,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case tflBoard:
 			if msg.err == nil {
-				m.arrivals, m.status, m.fetchedAt = v.arrivals, v.status, time.Now()
+				m.arrivals, m.timed, m.status, m.fetchedAt = v.arrivals, v.timed, v.status, time.Now()
 			}
 			return m, later
 		case []arrival:
@@ -435,7 +443,7 @@ func (m model) key(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		switch {
 		case m.screen == pickMode:
 			return m, tea.Quit
-		case m.screen == pickStop && m.mode == nationalRail:
+		case m.screen == pickStop && (m.mode == nationalRail || m.mode == thameslink):
 			m.screen = pickMode
 		default:
 			m.screen--
@@ -468,12 +476,16 @@ func (m model) key(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			m.loading = true
+			if m.mode == thameslink { // one line, so straight to its stations
+				m.line = line{thameslink, "Thameslink"}
+				return m, fetch[[]stop](m.gen, api+"/Line/thameslink/StopPoints")
+			}
 			return m, fetch[[]line](m.gen, api+"/Line/Mode/"+m.mode)
 		case pickLine:
 			m.line, m.loading = m.lines[i], true
 			return m, fetch[[]stop](m.gen, api+"/Line/"+m.line.ID+"/StopPoints")
 		case pickStop:
-			m.stop, m.arrivals, m.services, m.notes, m.platform = m.stops[i], nil, nil, nil, 0
+			m.stop, m.arrivals, m.services, m.timed, m.notes, m.platform = m.stops[i], nil, nil, nil, nil, 0
 			return m.show(board)
 		}
 	default:
@@ -560,13 +572,23 @@ func (m model) boardView() string {
 	}
 	rowsH := max(0, ih-4-clockH) // title, blank, ticker, blank
 
-	out := []string{fit(short(m.stop.CommonName)+" · "+m.line.Name+" · "+cmp.Or(platform, "All platforms"), iw), fit(m.notice(), iw)}
+	// Buses name the stop letter and direction; platforms only matter when there's a choice.
+	where, footer := short(m.stop.CommonName), " m map · b back · q quit"
+	if m.mode == "bus" {
+		where = m.stop.label()
+	}
+	title := where + " · " + m.line.Name
+	if len(plats) > 2 {
+		title += " · " + cmp.Or(platform, "All platforms")
+		footer = " p platform ·" + footer
+	}
+	out := []string{fit(title, iw), fit(m.notice(), iw)}
 	for i, r := range rows {
 		if i == rowsH {
 			break
 		}
 		left := r.left
-		if m.mode != nationalRail {
+		if m.mode != nationalRail && m.mode != thameslink { // rail boards lead with the time instead
 			left = fmt.Sprintf("%d  %s", i+1, left)
 		}
 		left = fit(left, iw-lipgloss.Width(r.right)-1)
@@ -618,7 +640,7 @@ func (m model) boardView() string {
 	} else {
 		out = append(out, lipgloss.PlaceHorizontal(iw, lipgloss.Center, time.Now().Format("15:04:05")))
 	}
-	return m.frame(out, " p platform · m map · b back · q quit")
+	return m.frame(out, footer)
 }
 
 // fit truncates s to n runes.

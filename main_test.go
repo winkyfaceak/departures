@@ -166,3 +166,41 @@ func TestSchematic(t *testing.T) {
 		t.Errorf("want ▶ at %v, got %v", p[len(p)/2], trains)
 	}
 }
+
+func TestThameslinkAndBuses(t *testing.T) {
+	var ds []timedDeparture
+	if err := json.Unmarshal([]byte(`[
+		{"platformName":"Platform 4","destinationName":"Bedford Rail Station","departureStatus":"OnTime",
+		 "scheduledTimeOfDeparture":"2026-10-11T10:28:00Z","estimatedTimeOfDeparture":"2026-10-11T10:28:00Z"},
+		{"platformName":"Platform 3","destinationName":"Sutton (London) Rail Station","departureStatus":"Cancelled",
+		 "scheduledTimeOfDeparture":"2026-10-11T10:16:00Z","cause":"Shortage of train crew"},
+		{"platformName":"Platform 3","destinationName":"Three Bridges Rail Station","departureStatus":"Delayed",
+		 "scheduledTimeOfDeparture":"2026-10-11T10:20:00Z","estimatedTimeOfDeparture":"2026-10-11T10:25:00Z"},
+		{"platformName":"Platform 4","destinationName":"Gone Rail Station","departureStatus":"OnTime",
+		 "scheduledTimeOfDeparture":"2026-10-11T10:00:00Z","estimatedTimeOfDeparture":"2026-10-11T10:00:00Z"}]`), &ds); err != nil {
+		t.Fatal(err)
+	}
+	now, _ := time.Parse(time.RFC3339, "2026-10-11T10:15:30Z")
+	rows := timedRows(ds, now)
+	local := func(s string) string { tm, _ := time.Parse(time.RFC3339, s); return tm.Local().Format("15:04") }
+	want := []row{
+		{local("2026-10-11T10:16:00Z") + "  Sutton (London)", "Plat 3  Cancelled", "Platform 3", "Shortage of train crew"},
+		{local("2026-10-11T10:20:00Z") + "  Three Bridges", "Plat 3  Exp " + local("2026-10-11T10:25:00Z"), "Platform 3", ""},
+		{local("2026-10-11T10:28:00Z") + "  Bedford", "Plat 4  On time", "Platform 4", ""},
+	}
+	if len(rows) != len(want) {
+		t.Fatalf("got %d rows, want %d: %+v", len(rows), len(want), rows)
+	}
+	for i := range want {
+		if rows[i] != want[i] {
+			t.Errorf("row %d = %+v, want %+v", i, rows[i], want[i])
+		}
+	}
+
+	m := model{screen: pickLine, mode: "bus", gen: 1}
+	next, _ := m.Update(loaded{1, []stop{{NaptanID: "490G00004202", CommonName: "Abney Park", StopType: "NaptanOnstreetBusCoachStopPair"},
+		{NaptanID: "490004202E", CommonName: "Abney Park", Indicator: "->E", StopType: "NaptanPublicBusCoachTram"}}, nil})
+	if s := next.(model).stops; len(s) != 1 || s[0].NaptanID != "490004202E" {
+		t.Errorf("bus stop pairs should be dropped: %+v", s)
+	}
+}

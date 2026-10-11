@@ -42,25 +42,40 @@ func (l lineStatus) summary() string {
 	return strings.Join(d, " · ")
 }
 
-// tflBoard is a stop's arrivals plus its line's status.
+// tflBoard is a stop's arrivals (or Thameslink departures) plus its line's status.
 type tflBoard struct {
 	arrivals []arrival
+	timed    []timedDeparture
 	status   []lineStatus
 }
 
 func fetchBoard(gen int, line, stop string) tea.Cmd {
 	return func() tea.Msg {
-		a, err := get[[]arrival](api + "/Line/" + line + "/Arrivals/" + stop)
+		var b tflBoard
+		var err error
+		if line == thameslink {
+			b.timed, err = get[[]timedDeparture](api + "/StopPoint/" + stop + "/ArrivalDepartures?lineIds=" + line)
+		} else {
+			b.arrivals, err = get[[]arrival](api + "/Line/" + line + "/Arrivals/" + stop)
+		}
 		if err != nil {
 			return loaded{gen, tflBoard{}, err}
 		}
-		s, _ := get[[]lineStatus](api + "/Line/" + line + "/Status") // board still works without status
-		return loaded{gen, tflBoard{a, s}, nil}
+		b.status, _ = get[[]lineStatus](api + "/Line/" + line + "/Status") // board still works without status
+		return loaded{gen, b, nil}
 	}
 }
 
 func fetchStatus(gen int) tea.Cmd {
-	return fetch[[]lineStatus](gen, api+"/Line/Mode/"+railModes+"/Status")
+	return func() tea.Msg {
+		all, err := get[[]lineStatus](api + "/Line/Mode/" + railModes + "/Status")
+		if err == nil {
+			var tl []lineStatus
+			tl, err = get[[]lineStatus](api + "/Line/thameslink/Status")
+			all = append(all, tl...)
+		}
+		return loaded{gen, all, err}
+	}
 }
 
 // trouble is this line's status when it isn't good service.
@@ -134,7 +149,7 @@ func (m model) disruptionsTop() int {
 func (m model) disruptionsView() string {
 	iw, ih := m.w-4, m.h-3
 	body, top := m.disruptionLines(iw), m.disruptionsTop()
-	out := append([]string{"Service status · tube, Elizabeth line, Overground, DLR, tram", ""}, body[top:min(len(body), top+ih-2)]...)
+	out := append([]string{"Service status · tube, Elizabeth line, Overground, DLR, tram, Thameslink", ""}, body[top:min(len(body), top+ih-2)]...)
 	out[0] = fit(out[0], iw)
 	for len(out) < ih {
 		out = append(out, "")
