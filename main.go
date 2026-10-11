@@ -174,6 +174,7 @@ const (
 	pickStop
 	board
 	mapScreen
+	disruptions
 )
 
 type model struct {
@@ -197,6 +198,9 @@ type model struct {
 	routeLine string        // line route belongs to
 	traffic   []arrival     // TfL map: every prediction on the line
 	trafficAt time.Time
+	status    []lineStatus // TfL line status: this line on the board, all lines on disruptions
+	notes     []string     // National Rail station messages
+	scroll    int          // disruptions screen
 }
 
 func (m model) Init() tea.Cmd { return tick() }
@@ -264,21 +268,23 @@ func platforms(rows []row) []string {
 	return p
 }
 
-// live fetches whatever the current board or map shows.
+// live fetches whatever the current board, map or disruptions screen shows.
 func (m model) live() tea.Cmd {
 	switch {
 	case m.mode == nationalRail:
 		return fetchRail(m.gen, m.stop.NaptanID)
 	case m.screen == mapScreen:
 		return fetch[[]arrival](m.gen, api+"/Line/"+m.line.ID+"/Arrivals")
+	case m.screen == disruptions:
+		return fetchStatus(m.gen, m.mode, m.line.ID)
 	default:
-		return fetch[[]arrival](m.gen, api+"/Line/"+m.line.ID+"/Arrivals/"+m.stop.NaptanID)
+		return fetchBoard(m.gen, m.line.ID, m.stop.NaptanID)
 	}
 }
 
 // show switches to the board or map and starts its fetches.
 func (m model) show(s screen) (tea.Model, tea.Cmd) {
-	m.screen, m.err = s, nil
+	m.screen, m.err, m.scroll = s, nil, 0
 	m.gen++
 	if m.mode == nationalRail && railKey == "" {
 		m.err = errNoKey
@@ -323,16 +329,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if msg.err == nil {
 				m.route, m.routeLine = v, m.line.ID
 			}
+		case tflBoard:
+			if msg.err == nil {
+				m.arrivals, m.status, m.fetchedAt = v.arrivals, v.status, time.Now()
+			}
+			return m, later
 		case []arrival:
-			if msg.err == nil && m.screen == board {
-				m.arrivals, m.fetchedAt = v, time.Now()
-			} else if msg.err == nil {
+			if msg.err == nil {
 				m.traffic, m.trafficAt = v, time.Now()
+			}
+			return m, later
+		case []lineStatus:
+			if msg.err == nil {
+				m.status = v
 			}
 			return m, later
 		case railBoard:
 			if msg.err == nil {
-				m.services = v.TrainServices
+				m.services, m.notes = v.TrainServices, v.notes()
 			}
 			return m, later
 		}
@@ -347,12 +361,17 @@ func (m model) key(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	if k == "ctrl+c" {
 		return m, tea.Quit
 	}
-	if m.screen == mapScreen {
+	if m.screen == mapScreen || m.screen == disruptions {
 		switch k {
 		case "q":
 			return m, tea.Quit
-		case "m", "b", "esc":
+		case "m", "d", "b", "esc":
 			return m.show(board)
+		case "up":
+			m.scroll = max(0, m.scroll-1)
+		case "down":
+			m.scroll++
+			m.scroll = m.disruptionsTop()
 		}
 		return m, nil
 	}
@@ -367,6 +386,8 @@ func (m model) key(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.platform++
 		case "m":
 			return m.show(mapScreen)
+		case "d":
+			return m.show(disruptions)
 		}
 		return m, nil
 	}
@@ -438,6 +459,8 @@ func (m model) View() tea.View {
 		s = m.boardView()
 	case m.screen == mapScreen:
 		s = m.mapView()
+	case m.screen == disruptions:
+		s = m.disruptionsView()
 	default:
 		s = m.pickView()
 	}
@@ -501,7 +524,7 @@ func (m model) boardView() string {
 	}
 	rowsH := max(0, ih-4-clockH) // title, blank, ticker, blank
 
-	out := []string{fit(short(m.stop.CommonName)+" · "+m.line.Name+" · "+cmp.Or(platform, "All platforms"), iw), ""}
+	out := []string{fit(short(m.stop.CommonName)+" · "+m.line.Name+" · "+cmp.Or(platform, "All platforms"), iw), fit(m.notice(), iw)}
 	for i, r := range rows {
 		if i == rowsH {
 			break
@@ -528,10 +551,14 @@ func (m model) boardView() string {
 	}
 	out = out[:2+rowsH]
 
+	msg := m.troubleReason()
+	if len(rows) > 0 {
+		msg = strings.TrimSpace(msg + "   " + rows[0].ticker)
+	}
 	ticker := ""
-	if len(rows) > 0 && rows[0].ticker != "" {
+	if msg != "" {
 		pad := strings.Repeat(" ", iw)
-		r := []rune(pad + rows[0].ticker + pad)
+		r := []rune(pad + msg + pad)
 		off := int(time.Now().UnixMilli()/125) % (len(r) - iw)
 		ticker = string(r[off : off+iw])
 	}
@@ -555,7 +582,7 @@ func (m model) boardView() string {
 	} else {
 		out = append(out, lipgloss.PlaceHorizontal(iw, lipgloss.Center, time.Now().Format("15:04:05")))
 	}
-	return m.frame(out, " p platform · m map · b back · q quit")
+	return m.frame(out, " p platform · m map · d disruptions · b back · q quit")
 }
 
 // fit truncates s to n runes.

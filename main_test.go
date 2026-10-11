@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -81,5 +82,42 @@ func TestMap(t *testing.T) {
 		if w := lipgloss.Width(row); w != 30 {
 			t.Errorf("drawMap row %d width %d, want 30", i, w)
 		}
+	}
+}
+
+func TestDisruptions(t *testing.T) {
+	var all []lineStatus
+	err := json.Unmarshal([]byte(`[
+		{"id":"victoria","name":"Victoria","lineStatuses":[{"statusSeverity":10,"statusSeverityDescription":"Good Service"}]},
+		{"id":"central","name":"Central","lineStatuses":[{"statusSeverity":10,"statusSeverityDescription":"Good Service"}]},
+		{"id":"piccadilly","name":"Piccadilly","lineStatuses":[
+			{"statusSeverity":6,"statusSeverityDescription":"Severe Delays","reason":"Signal failure. "},
+			{"statusSeverity":5,"statusSeverityDescription":"Part Closure","reason":"Engineering works."}]}]`), &all)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !all[0].fine() || all[2].fine() || all[2].summary() != "Severe Delays · Part Closure" {
+		t.Errorf("fine/summary wrong: %+v", all)
+	}
+
+	m := model{w: 60, h: 20, status: all, line: line{ID: "central"}}
+	if m.notice() != "" {
+		t.Errorf("good service shouldn't warn: %q", m.notice())
+	}
+	_, body := m.disruptionLines(56)
+	if !strings.HasPrefix(body[0], "Central") || !strings.HasPrefix(body[1], "Piccadilly") {
+		t.Errorf("want your line, then problems first: %q", body[:2])
+	}
+	m.line.ID = "piccadilly"
+	if m.notice() != "▲ Severe Delays · Part Closure · d for details" || m.troubleReason() != "Signal failure.   Engineering works." {
+		t.Errorf("notice %q reason %q", m.notice(), m.troubleReason())
+	}
+
+	if got := plain(`<p>Disruption at <a href="x">Reading</a> &amp; Slough.</p>`); got != "Disruption at Reading & Slough." {
+		t.Errorf("plain = %q", got)
+	}
+	s := railService{Std: "09:00", Etd: "Delayed", DelayReason: "This train has been delayed by a signalling fault"}
+	if r := s.row(); r.ticker != "This train has been delayed by a signalling fault.  " {
+		t.Errorf("delay reason ticker = %q", r.ticker)
 	}
 }

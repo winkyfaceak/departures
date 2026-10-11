@@ -1,10 +1,13 @@
 package main
 
 import (
+	"cmp"
 	_ "embed"
 	"encoding/csv"
 	"errors"
+	"html"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -42,10 +45,29 @@ var railStations, railByCRS = func() ([]stop, map[string]stop) {
 	return list, by
 }()
 
-type railBoard struct{ TrainServices []railService }
+type railBoard struct {
+	TrainServices []railService
+	NrccMessages  []struct{ Value string }
+}
+
+// notes returns the station's messages as plain text.
+func (b railBoard) notes() []string {
+	var out []string
+	for _, n := range b.NrccMessages {
+		out = append(out, plain(n.Value))
+	}
+	return out
+}
+
+var tag = regexp.MustCompile(`<[^>]*>`)
+
+// plain strips the HTML National Rail puts in messages.
+func plain(s string) string {
+	return strings.Join(strings.Fields(html.UnescapeString(tag.ReplaceAllString(s, " "))), " ")
+}
 
 type railService struct {
-	Std, Etd, Platform                             string
+	Std, Etd, Platform, DelayReason, CancelReason  string
 	Destination                                    []struct{ LocationName string }
 	PreviousCallingPoints, SubsequentCallingPoints []struct{ CallingPoint []callingPoint }
 }
@@ -82,6 +104,9 @@ func (s railService) row() row {
 		ticker = "Calling at: " + stops[0] + " only."
 	} else if n > 1 {
 		ticker = "Calling at: " + strings.Join(stops[:n-1], ", ") + " and " + stops[n-1] + "."
+	}
+	if reason := cmp.Or(s.CancelReason, s.DelayReason); reason != "" {
+		ticker = reason + ".  " + ticker
 	}
 	return row{s.Std + "  " + strings.Join(dest, " & "), right, s.Platform, ticker}
 }
