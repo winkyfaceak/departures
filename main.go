@@ -1,5 +1,6 @@
 // Command departures is a dot-matrix departure board for London trains and
-// buses, using the TfL API (no key needed).
+// buses (TfL API, no key needed) and National Rail stations (free
+// Rail Data Marketplace key).
 package main
 
 import (
@@ -19,11 +20,12 @@ import (
 )
 
 const (
-	api     = "https://api.tfl.gov.uk"
-	refresh = 30 * time.Second // keyless TfL allows 50 requests/min
+	api          = "https://api.tfl.gov.uk"
+	refresh      = 30 * time.Second // keyless TfL allows 50 requests/min
+	nationalRail = "national-rail"
 )
 
-var modes = []string{"tube", "elizabeth-line", "overground", "dlr", "tram", "bus"}
+var modes = []string{"tube", "elizabeth-line", "overground", "dlr", "tram", "bus", nationalRail}
 
 var (
 	amber  = lipgloss.Color("#FFB000")
@@ -74,6 +76,7 @@ type line struct{ ID, Name string }
 
 type stop struct {
 	NaptanID, CommonName, Indicator string
+	Lat, Lon                        float64
 	AdditionalProperties            []struct{ Key, Value string }
 }
 
@@ -91,6 +94,7 @@ func (s stop) label() string {
 }
 
 type arrival struct {
+	VehicleID, NaptanID, DestinationNaptanID       string
 	DestinationName, PlatformName, CurrentLocation string
 	TimeToStation                                  float64
 }
@@ -101,12 +105,11 @@ type departure struct {
 }
 
 // departures lists arrivals soonest first, counted down by age since the
-// fetch, on one platform ("" for all). Trains gone >30s are dropped.
-func departures(arrivals []arrival, age time.Duration, platform string) []departure {
+// fetch. Trains gone >30s are dropped.
+func departures(arrivals []arrival, age time.Duration) []departure {
 	var out []departure
 	for _, a := range arrivals {
-		d := departure{a.TimeToStation - age.Seconds(), a}
-		if (platform == "" || a.PlatformName == platform) && d.secs > -30 {
+		if d := (departure{a.TimeToStation - age.Seconds(), a}); d.secs > -30 {
 			out = append(out, d)
 		}
 	}
@@ -114,22 +117,28 @@ func departures(arrivals []arrival, age time.Duration, platform string) []depart
 	return out
 }
 
+// row is one line on the board, whichever network it came from.
+type row struct{ left, right, platform, ticker string }
+
 var client = &http.Client{Timeout: 10 * time.Second}
 
-func get[T any](path string) (T, error) {
+func get[T any](url string) (T, error) {
 	var v T
-	req, err := http.NewRequest("GET", api+path, nil)
+	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return v, err
 	}
 	req.Header.Set("User-Agent", "departures-board")
+	if strings.HasPrefix(url, railAPI) {
+		req.Header.Set("x-apikey", railKey)
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return v, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return v, fmt.Errorf("TfL: %s", resp.Status)
+		return v, fmt.Errorf("%s", resp.Status)
 	}
 	return v, json.NewDecoder(resp.Body).Decode(&v)
 }
@@ -146,9 +155,9 @@ type (
 	refreshMsg int
 )
 
-func fetch[T any](gen int, path string) tea.Cmd {
+func fetch[T any](gen int, url string) tea.Cmd {
 	return func() tea.Msg {
-		v, err := get[T](path)
+		v, err := get[T](url)
 		return loaded{gen, v, err}
 	}
 }
@@ -164,6 +173,7 @@ const (
 	pickLine
 	pickStop
 	board
+	mapScreen
 )
 
 type model struct {
@@ -179,9 +189,14 @@ type model struct {
 	stops     []stop
 	line      line
 	stop      stop
-	arrivals  []arrival
-	fetchedAt time.Time
 	platform  int
+	arrivals  []arrival // TfL board
+	fetchedAt time.Time
+	services  []railService // National Rail board and map
+	route     routeSeq      // TfL map
+	routeLine string        // line route belongs to
+	traffic   []arrival     // TfL map: every prediction on the line
+	trafficAt time.Time
 }
 
 func (m model) Init() tea.Cmd { return tick() }
@@ -218,17 +233,63 @@ func (m model) shown() []int {
 	return append(pre, rest...)
 }
 
-func (m model) platforms() []string {
+func (m model) rows() []row {
+	var rows []row
+	if m.mode == nationalRail {
+		for _, s := range m.services {
+			rows = append(rows, s.row())
+		}
+		return rows
+	}
+	for _, d := range departures(m.arrivals, time.Since(m.fetchedAt)) {
+		eta := "Due"
+		if d.secs >= 60 {
+			eta = fmt.Sprintf("%d min", int(d.secs/60))
+		}
+		rows = append(rows, row{short(d.DestinationName), eta, d.PlatformName, d.CurrentLocation})
+	}
+	return rows
+}
+
+func platforms(rows []row) []string {
 	seen := map[string]bool{}
 	p := []string{""}
-	for _, a := range m.arrivals {
-		if !seen[a.PlatformName] {
-			seen[a.PlatformName] = true
-			p = append(p, a.PlatformName)
+	for _, r := range rows {
+		if !seen[r.platform] {
+			seen[r.platform] = true
+			p = append(p, r.platform)
 		}
 	}
 	sort.Strings(p[1:])
 	return p
+}
+
+// live fetches whatever the current board or map shows.
+func (m model) live() tea.Cmd {
+	switch {
+	case m.mode == nationalRail:
+		return fetchRail(m.gen, m.stop.NaptanID)
+	case m.screen == mapScreen:
+		return fetch[[]arrival](m.gen, api+"/Line/"+m.line.ID+"/Arrivals")
+	default:
+		return fetch[[]arrival](m.gen, api+"/Line/"+m.line.ID+"/Arrivals/"+m.stop.NaptanID)
+	}
+}
+
+// show switches to the board or map and starts its fetches.
+func (m model) show(s screen) (tea.Model, tea.Cmd) {
+	m.screen, m.err = s, nil
+	m.gen++
+	if m.mode == nationalRail && railKey == "" {
+		m.err = errNoKey
+		return m, nil
+	}
+	m.loading = true
+	cmd := m.live()
+	if s == mapScreen && m.mode != nationalRail && m.routeLine != m.line.ID {
+		cmd = tea.Batch(cmd, fetch[routeSeq](m.gen, api+"/Line/"+m.line.ID+"/Route/Sequence/all"))
+	}
+	return m, cmd
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -238,31 +299,42 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tickMsg:
 		return m, tick()
 	case refreshMsg:
-		if int(msg) == m.gen && m.screen == board {
-			return m, fetch[[]arrival](m.gen, "/Line/"+m.line.ID+"/Arrivals/"+m.stop.NaptanID)
+		if int(msg) == m.gen && m.screen >= board {
+			return m, m.live()
 		}
 	case loaded:
 		if msg.gen != m.gen {
 			return m, nil
 		}
 		m.loading, m.err = false, msg.err
-		if m.screen == board {
-			if msg.err == nil {
-				m.arrivals, m.fetchedAt = msg.v.([]arrival), time.Now()
-			}
-			gen := m.gen
-			return m, tea.Tick(refresh, func(time.Time) tea.Msg { return refreshMsg(gen) })
-		}
-		if msg.err != nil {
-			return m, nil
-		}
-		m.query, m.sel = "", 0
+		gen := m.gen
+		later := tea.Tick(refresh, func(time.Time) tea.Msg { return refreshMsg(gen) })
 		switch v := msg.v.(type) {
 		case []line:
-			m.lines, m.screen = v, pickLine
+			if msg.err == nil {
+				m.lines, m.screen, m.query, m.sel = v, pickLine, "", 0
+			}
 		case []stop:
-			sort.Slice(v, func(i, j int) bool { return v[i].label() < v[j].label() })
-			m.stops, m.screen = v, pickStop
+			if msg.err == nil {
+				sort.Slice(v, func(i, j int) bool { return v[i].label() < v[j].label() })
+				m.stops, m.screen, m.query, m.sel = v, pickStop, "", 0
+			}
+		case routeSeq:
+			if msg.err == nil {
+				m.route, m.routeLine = v, m.line.ID
+			}
+		case []arrival:
+			if msg.err == nil && m.screen == board {
+				m.arrivals, m.fetchedAt = v, time.Now()
+			} else if msg.err == nil {
+				m.traffic, m.trafficAt = v, time.Now()
+			}
+			return m, later
+		case railBoard:
+			if msg.err == nil {
+				m.services = v.TrainServices
+			}
+			return m, later
 		}
 	case tea.KeyPressMsg:
 		return m.key(msg)
@@ -275,6 +347,15 @@ func (m model) key(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	if k == "ctrl+c" {
 		return m, tea.Quit
 	}
+	if m.screen == mapScreen {
+		switch k {
+		case "q":
+			return m, tea.Quit
+		case "m", "b", "esc":
+			return m.show(board)
+		}
+		return m, nil
+	}
 	if m.screen == board {
 		switch k {
 		case "q":
@@ -284,6 +365,8 @@ func (m model) key(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.gen++
 		case "p":
 			m.platform++
+		case "m":
+			return m.show(mapScreen)
 		}
 		return m, nil
 	}
@@ -298,10 +381,15 @@ func (m model) key(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	shown := m.shown()
 	switch k {
 	case "esc":
-		if m.screen == pickMode {
+		switch {
+		case m.screen == pickMode:
 			return m, tea.Quit
+		case m.screen == pickStop && m.mode == nationalRail:
+			m.screen = pickMode
+		default:
+			m.screen--
 		}
-		m.screen, m.query, m.sel, m.err = m.screen-1, "", 0, nil
+		m.query, m.sel, m.err = "", 0, nil
 	case "up":
 		m.sel = max(0, m.sel-1)
 	case "down":
@@ -316,17 +404,23 @@ func (m model) key(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 		i := shown[m.sel]
 		m.gen++
-		m.loading, m.err = true, nil
+		m.err = nil
 		switch m.screen {
 		case pickMode:
 			m.mode = modes[i]
-			return m, fetch[[]line](m.gen, "/Line/Mode/"+m.mode)
+			if m.mode == nationalRail {
+				m.line = line{nationalRail, "National Rail"}
+				m.stops, m.screen, m.query, m.sel = railStations, pickStop, "", 0
+				return m, nil
+			}
+			m.loading = true
+			return m, fetch[[]line](m.gen, api+"/Line/Mode/"+m.mode)
 		case pickLine:
-			m.line = m.lines[i]
-			return m, fetch[[]stop](m.gen, "/Line/"+m.line.ID+"/StopPoints")
+			m.line, m.loading = m.lines[i], true
+			return m, fetch[[]stop](m.gen, api+"/Line/"+m.line.ID+"/StopPoints")
 		case pickStop:
-			m.stop, m.screen, m.arrivals, m.platform = m.stops[i], board, nil, 0
-			return m, fetch[[]arrival](m.gen, "/Line/"+m.line.ID+"/Arrivals/"+m.stop.NaptanID)
+			m.stop, m.arrivals, m.services, m.platform = m.stops[i], nil, nil, 0
+			return m.show(board)
 		}
 	default:
 		if msg.Text != "" {
@@ -338,12 +432,14 @@ func (m model) key(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 
 func (m model) View() tea.View {
 	var s string
-	if m.w > 0 {
-		if m.screen == board {
-			s = m.boardView()
-		} else {
-			s = m.pickView()
-		}
+	switch {
+	case m.w == 0:
+	case m.screen == board:
+		s = m.boardView()
+	case m.screen == mapScreen:
+		s = m.mapView()
+	default:
+		s = m.pickView()
 	}
 	v := tea.NewView(s)
 	v.AltScreen = true
@@ -377,11 +473,25 @@ func (m model) pickView() string {
 	return strings.Join(append(out, dim.Render(" "+help)), "\n")
 }
 
+// frame wraps board or map content in the bordered box with a footer.
+func (m model) frame(content []string, footer string) string {
+	if m.err != nil && m.err != errNoKey {
+		footer += " · " + m.err.Error()
+	}
+	return box.Width(m.w).Render(strings.Join(content, "\n")) + "\n" + dim.Render(fit(footer, m.w))
+}
+
 func (m model) boardView() string {
 	iw, ih := m.w-4, m.h-3 // inside border+padding; one line kept for the footer
-	platforms := m.platforms()
-	platform := platforms[m.platform%len(platforms)]
-	deps := departures(m.arrivals, time.Since(m.fetchedAt), platform)
+	all := m.rows()
+	plats := platforms(all)
+	platform := plats[m.platform%len(plats)]
+	var rows []row
+	for _, r := range all {
+		if platform == "" || r.platform == platform {
+			rows = append(rows, r)
+		}
+	}
 
 	clock := dots(time.Now().Format("15:04:05"))
 	big := len(clock[0])*2 <= iw && ih >= 12
@@ -392,30 +502,36 @@ func (m model) boardView() string {
 	rowsH := max(0, ih-4-clockH) // title, blank, ticker, blank
 
 	out := []string{fit(short(m.stop.CommonName)+" · "+m.line.Name+" · "+cmp.Or(platform, "All platforms"), iw), ""}
-	for i, d := range deps {
+	for i, r := range rows {
 		if i == rowsH {
 			break
 		}
-		eta := "Due"
-		if d.secs >= 60 {
-			eta = fmt.Sprintf("%d min", int(d.secs/60))
+		left := r.left
+		if m.mode != nationalRail {
+			left = fmt.Sprintf("%d  %s", i+1, left)
 		}
-		left := fit(fmt.Sprintf("%d  %s", i+1, short(d.DestinationName)), iw-10)
-		out = append(out, left+strings.Repeat(" ", max(1, iw-lipgloss.Width(left)-len(eta)))+eta)
+		left = fit(left, iw-lipgloss.Width(r.right)-1)
+		out = append(out, left+strings.Repeat(" ", max(1, iw-lipgloss.Width(left)-lipgloss.Width(r.right)))+r.right)
 	}
-	if len(deps) == 0 && m.loading {
+	switch {
+	case m.err == errNoKey:
+		out = append(out, errNoKey.Error()+".", "", "Get a free key at raildata.org.uk: subscribe to", "“Live Departure Board”, copy the consumer key,", "set NATIONAL_RAIL_KEY to it and restart.")
+	case len(rows) == 0 && m.loading:
 		out = append(out, "Loading…")
-	} else if len(deps) == 0 {
+	case len(rows) == 0 && m.err != nil:
+		out = append(out, "Failed: "+m.err.Error())
+	case len(rows) == 0:
 		out = append(out, "No departures")
 	}
 	for len(out) < 2+rowsH {
 		out = append(out, "")
 	}
+	out = out[:2+rowsH]
 
 	ticker := ""
-	if len(deps) > 0 && deps[0].CurrentLocation != "" {
+	if len(rows) > 0 && rows[0].ticker != "" {
 		pad := strings.Repeat(" ", iw)
-		r := []rune(pad + deps[0].CurrentLocation + pad)
+		r := []rune(pad + rows[0].ticker + pad)
 		off := int(time.Now().UnixMilli()/125) % (len(r) - iw)
 		ticker = string(r[off : off+iw])
 	}
@@ -439,12 +555,7 @@ func (m model) boardView() string {
 	} else {
 		out = append(out, lipgloss.PlaceHorizontal(iw, lipgloss.Center, time.Now().Format("15:04:05")))
 	}
-
-	footer := " p platform · b back · q quit"
-	if m.err != nil {
-		footer += " · no signal, retrying"
-	}
-	return box.Width(m.w).Render(strings.Join(out, "\n")) + "\n" + dim.Render(footer)
+	return m.frame(out, " p platform · m map · b back · q quit")
 }
 
 // fit truncates s to n runes.
